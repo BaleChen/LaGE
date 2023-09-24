@@ -2,6 +2,7 @@ import argparse
 import os
 import json
 from time import gmtime, strftime
+from functools import partial
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -14,6 +15,8 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, logging, set_seed, TrainerCallback
 
 from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
+import pdb
+
 
 def print_rank_0(*args, **kwargs) -> None:
     if not dist.is_initialized() or dist.get_rank() == 0:
@@ -49,6 +52,13 @@ def formatting_prompts_func(examples):
         output_text.append(text)
 
     return output_text
+
+def formatting_dialogue_func(examples, tokenizer, seq_length):
+    out = []
+    for i in range(len(examples["chosen"])):
+        if len(tokenizer.encode(examples["chosen"][i])) <= seq_length:
+            out.append(examples["chosen"][i])
+    return out
     
 def print_trainable_parameters(model):
     """
@@ -88,24 +98,31 @@ def main(args):
     )
 
     # tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, add_eos_token=True)
     tokenizer.pad_token = tokenizer.unk_token
     tokenizer.pad_token_id = tokenizer.unk_token_id
     tokenizer.padding_side = "right"
-    # NOTE: please check for potential tokenizer config issues
-
+    
     # dataset
-    jsonl_files = {
-        "train": os.path.join(args.data_path, "train.jsonl"),
-        "validation": os.path.join(args.data_path, "validation.jsonl"),
-    }
-    data = load_dataset("json", data_files=jsonl_files)
+    if args.data_path == "Anthropic/hh-rlhf":
+        data = load_dataset(args.data_path, data_dir="helpful-base") # Using only a subset
+        data["validation"] = data["test"]
+        del data["test"]
+    else:
+        jsonl_files = {
+            "train": os.path.join(args.data_path, "train.jsonl"),
+            "validation": os.path.join(args.data_path, "validation.jsonl"),
+        }
+        data = load_dataset("json", data_files=jsonl_files)
 
     train_set_size = int(len(data["train"]) * args.train_pct) if not args.debug else 50
     train_data = data["train"].select(range(train_set_size))
     val_data = data["validation"].select(range(25)) if args.debug else data["validation"]
 
-    response_template_ids = tokenizer.encode("\n\n### Response:\n", add_special_tokens=False)[3:] 
+    if args.data_format == "dialogue":
+        response_template_ids = tokenizer.encode("\n\nAssistant:", add_special_tokens=False)[1:] # Wordaround for 29871
+    elif args.data_format == "instruction":
+        response_template_ids = tokenizer.encode("\n\n### Response:\n", add_special_tokens=False)[3:] 
     # NOTE: The first token id is for some reason a empty string 29871, which we need to remove
     # Otherwise, the data collator can't find this response template in the input_ids. This is a bug
     # and I will file a issue to trl repo later. The above code is just a temporary work around.
@@ -136,13 +153,16 @@ def main(args):
         ddp_find_unused_parameters=False,
     )
 
+    partial_formatting_dialogue_func = partial(formatting_dialogue_func, tokenizer=tokenizer, seq_length=args.seq_length)
+
     trainer = SFTTrainer(
         model=model,
+        tokenizer=tokenizer,
         args=training_args,
         train_dataset=train_data,
         eval_dataset=val_data,
         peft_config=lora_config,
-        formatting_func=formatting_prompts_func,
+        formatting_func=formatting_prompts_func if args.data_format == "instruction" else partial_formatting_dialogue_func,
         max_seq_length=args.seq_length, 
         data_collator=DataCollatorForCompletionOnlyLM(response_template_ids, tokenizer=tokenizer, pad_to_multiple_of=args.seq_length),
         packing=False,
@@ -173,16 +193,17 @@ if __name__ == "__main__":
 
     parser.add_argument("--model_name_or_path", type=str, default="yahma/llama-7b-hf")
     parser.add_argument("--data_path", type=str, default="./data/ILF-refinement-sft")
-    parser.add_argument("--train_pct", type=float, default=0.4)
+    parser.add_argument("--data_format", type=str, default="instruction")
+    parser.add_argument("--train_pct", type=float, default=0.5)
     parser.add_argument("--output_dir", type=str, default="./out")
     parser.add_argument("--lora_rank", type=int, default=8)
 
     parser.add_argument("--log_freq", type=int, default=10)
     parser.add_argument("--eval_freq", type=int, default=50)
-    parser.add_argument("--save_freq", type=int, default=50)
+    parser.add_argument("--save_freq", type=int, default=100)
 
     parser.add_argument("--max_steps", type=int, default=400)
-    parser.add_argument("--seq_length", type=int, default=862)
+    parser.add_argument("--seq_length", type=int, default=1024)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--per_device_batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=3e-4)

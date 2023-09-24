@@ -21,7 +21,7 @@ from transformers import (
 
 from functools import partial
 from trl import RewardTrainer
-
+import pdb
 
 tqdm.pandas()
 
@@ -37,13 +37,13 @@ def preprocess_function(examples, tokenizer, max_length):
         "attention_mask_rejected": [],
     }
     for chosen, rejected in zip(examples["chosen"], examples["rejected"]):
-        tokenized_chosen = tokenizer(chosen, truncation=True, max_length=max_length)
-        tokenized_rejected = tokenizer(rejected, truncation=True, max_length=max_length)
-
-        new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
-        new_examples["attention_mask_chosen"].append(tokenized_chosen["attention_mask"])
-        new_examples["input_ids_rejected"].append(tokenized_rejected["input_ids"])
-        new_examples["attention_mask_rejected"].append(tokenized_rejected["attention_mask"])
+        tokenized_chosen = tokenizer(chosen)
+        tokenized_rejected = tokenizer(rejected)
+        if len(tokenized_chosen["input_ids"]) <= max_length and len(tokenized_rejected["input_ids"]) <= max_length:
+            new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
+            new_examples["attention_mask_chosen"].append(tokenized_chosen["attention_mask"])
+            new_examples["input_ids_rejected"].append(tokenized_rejected["input_ids"])
+            new_examples["attention_mask_rejected"].append(tokenized_rejected["attention_mask"])
 
     return new_examples
 
@@ -66,11 +66,11 @@ class ScriptArguments:
     data_path: Optional[str] = field(default="./data/ILF-refinement-rm", metadata={"help": "the model name"})
     dataset_text_field: Optional[str] = field(default="text", metadata={"help": "the text field of the dataset"})
     log_with: Optional[str] = field(default="wandb", metadata={"help": "use 'wandb' to log with wandb"})
-    logging_steps: Optional[int] = field(default=20, metadata={"help": "the number of update steps between two logs"})
+    logging_steps: Optional[int] = field(default=10, metadata={"help": "the number of update steps between two logs"})
     learning_rate: Optional[float] = field(default=1e-4, metadata={"help": "the learning rate"})
     per_device_batch_size: Optional[int] = field(default=1, metadata={"help": "the batch size"})
     num_train_epochs: Optional[int] = field(default=1, metadata={"help": "the number of training epochs"})
-    seq_length: Optional[int] = field(default=862, metadata={"help": "Input sequence length"})
+    seq_length: Optional[int] = field(default=1024, metadata={"help": "Input sequence length"})
     gradient_accumulation_steps: Optional[int] = field(
         default=4, metadata={"help": "the number of gradient accumulation steps"}
     )
@@ -79,18 +79,18 @@ class ScriptArguments:
     use_peft: Optional[bool] = field(default=True, metadata={"help": "Wether to use PEFT or not to train adapters"})
     trust_remote_code: Optional[bool] = field(default=True, metadata={"help": "Enable `trust_remote_code`"})
     output_dir: Optional[str] = field(default="./out/rm", metadata={"help": "the output directory"})
-    max_steps: Optional[int] = field(default=2000, metadata={"help": "the maximum number of training steps"})
+    max_steps: Optional[int] = field(default=1000, metadata={"help": "the maximum number of training steps"})
     debug: Optional[bool] = field(default=False, metadata={"help": "debug mode"})
-    save_freq: Optional[int] = field(default=200, metadata={"help": "the frequency at which to save the model"})
-    eval_freq: Optional[int] = field(default=200, metadata={"help": "the frequency at which to evaluate the model"})
+    save_freq: Optional[int] = field(default=100, metadata={"help": "the frequency at which to save the model"})
+    eval_freq: Optional[int] = field(default=100, metadata={"help": "the frequency at which to evaluate the model"})
     lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "the lr scheduler type"})
     num_warmup_steps: Optional[int] = field(default=10, metadata={"help": "the number of warmup steps"})
     no_fp16: Optional[bool] = field(default=False, metadata={"help": "disable fp16"})
     bf16: Optional[bool] = field(default=False, metadata={"help": "use bf16"})
     weight_decay: Optional[float] = field(default=0.05, metadata={"help": "the weight decay"})
     exp_name: Optional[str] = field(default="exp", metadata={"help": "the name of the experiment"})
-    padding_side: Optional[str] = field(default="right", metadata={"help": "the padding side"})
-    train_pct: Optional[float] = field(default=0.6, metadata={"help": "the percentage of the training set to use"})
+    padding_side: Optional[str] = field(default="left", metadata={"help": "the padding side"})
+    train_pct: Optional[float] = field(default=0.5, metadata={"help": "the percentage of the training set to use"})
     lora_rank: Optional[int] = field(default=8, metadata={"help": "the rank of the Lora matrix"})
 
 def main():
@@ -100,7 +100,7 @@ def main():
     if not script_args.debug:
         date_time = strftime("%Y-%m-%d-%H:%M", gmtime())
         script_args.exp_name = prepare_exp_name(script_args)
-        script_args.output_dir = os.path.join(script_args.output_dir, "sft", date_time+"-"+script_args.exp_name)
+        script_args.output_dir = os.path.join(script_args.output_dir, "sft", date_time+"-"+script_args.exp_name) # BUG: no need to add sft subfolder
         try:
             os.makedirs(script_args.output_dir)
         except FileExistsError:
@@ -134,15 +134,22 @@ def main():
     )
 
     # Step 2: Load the dataset and pre-process it
-    tokenizer = AutoTokenizer.from_pretrained(script_args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, add_eos_token=True)
     tokenizer.pad_token_id = tokenizer.unk_token_id
     tokenizer.pad_token = tokenizer.unk_token
     tokenizer.padding_side = script_args.padding_side
-    dataset_files = {
-        "train": os.path.join(script_args.data_path, "train.jsonl"),
-        "validation": os.path.join(script_args.data_path, "validation.jsonl")
-    }
-    data = load_dataset("json", data_files=dataset_files)
+
+    if script_args.data_path == "./data/ILF-refinement-rm":
+        dataset_files = {
+            "train": os.path.join(script_args.data_path, "train.jsonl"),
+            "validation": os.path.join(script_args.data_path, "validation.jsonl")
+        }
+        data = load_dataset("json", data_files=dataset_files)
+
+    elif script_args.data_path == "Anthropic/hh-rlhf":
+        data = load_dataset(script_args.data_path, data_dir="helpful-base") # Using only a subset
+        data["validation"] = data["test"]
+        del data["test"]
     train_data, eval_data = data["train"].select(range(int(script_args.train_pct * len(data["train"])))), data["validation"]
 
     if script_args.debug:
@@ -153,12 +160,14 @@ def main():
         preprocess_partial,
         batched=True,
         num_proc=4,
+        remove_columns=train_data.column_names
     )
 
     eval_data = eval_data.map(
         preprocess_partial,
         batched=True,
         num_proc=4,
+        remove_columns=eval_data.column_names
     )
 
     # Step 3: Define the training arguments
@@ -212,6 +221,7 @@ def main():
 
     example_chosen = tokenizer.batch_decode(batch["input_ids_chosen"])
     example_rejected = tokenizer.batch_decode(batch["input_ids_rejected"])
+
     for c, r in zip(example_chosen[:2], example_rejected[:2]):
         print_rank_0("====================Example====================")
         print_rank_0("[CHOSEN]:", c)
